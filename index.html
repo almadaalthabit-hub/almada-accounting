@@ -173,7 +173,18 @@ dialog{border:0;border-radius:20px;padding:0;width:min(700px,94vw);box-shadow:0 
 <div class="row no-print" style="margin-top:12px"><button class="btn primary" onclick="saveProduct()">حفظ القطعة</button><button class="btn secondary" onclick="clearProductForm()">جديد</button></div>
 <input type="hidden" id="prdEditId">
 </div>
-<div class="card half"><h2>بحث المخزون</h2><input id="productSearch" placeholder="اسم أو كود القطعة" oninput="renderProducts()"><p class="note">عند حفظ فاتورة، يخصم البرنامج الكمية المباعة تلقائيًا من المخزون.</p></div>
+<div class="card half">
+<h2>بحث واستيراد المخزون</h2>
+<input id="productSearch" placeholder="اسم أو كود القطعة" oninput="renderProducts()">
+<p class="note">عند حفظ فاتورة، يخصم البرنامج الكمية المباعة تلقائيًا من المخزون.</p>
+<div class="row no-print" style="margin-top:10px">
+  <label class="btn good" style="cursor:pointer">استيراد أصناف CSV
+    <input id="productsImportFile" type="file" accept=".csv,text/csv" hidden onchange="importProductsCSV(this.files[0])">
+  </label>
+  <button class="btn secondary" onclick="exportProductsCSV()">تصدير الأصناف CSV</button>
+</div>
+<p class="note">الاستيراد يضيف الأصناف الجديدة فقط، ويتجاوز أي كود موجود مسبقًا حتى لا يمسح أسعارك أو مخزونك الحالي.</p>
+</div>
 <div class="card"><div class="scroll"><table><thead><tr><th>الكود</th><th>الاسم</th><th>التصنيف</th><th>الوحدة</th><th>التكلفة</th><th>البيع</th><th>المخزون</th><th>التنبيه</th><th class="no-print">إجراء</th></tr></thead><tbody id="productsTable"></tbody></table></div></div>
 </div>
 </section>
@@ -334,6 +345,58 @@ async function saveAccount(){const a=JSON.parse(localStorage.getItem(AUTH_KEY)||
 function connectDrive(){const id=state.settings.googleClientId;if(!id)return alert("أدخل Google OAuth Client ID في الإعدادات أولًا");if(!google?.accounts?.oauth2)return alert("خدمة Google لم تجهز بعد، أعد المحاولة");const client=google.accounts.oauth2.initTokenClient({client_id:id,scope:"https://www.googleapis.com/auth/drive.file",callback:r=>{if(r.access_token){driveToken=r.access_token;$("driveStatus").textContent="تم الربط مع Google Drive";}else alert("تعذر الربط")}});client.requestAccessToken()}
 async function backupToDrive(){if(!driveToken){connectDrive();return}const meta={name:`AlMada_Backup_${new Date().toISOString().slice(0,19).replaceAll(":","-")}.json`,mimeType:"application/json"};const boundary="almada_"+Date.now();const body=`--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(meta)}\r\n--${boundary}\r\nContent-Type: application/json\r\n\r\n${JSON.stringify(backupObject())}\r\n--${boundary}--`;const r=await fetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart",{method:"POST",headers:{Authorization:"Bearer "+driveToken,"Content-Type":"multipart/related; boundary="+boundary},body});if(r.ok){$("driveStatus").textContent="تم حفظ النسخة على Google Drive بنجاح"}else{$("driveStatus").textContent="فشل الحفظ على Drive: "+r.status}}
 async function restoreLatestFromDrive(){if(!driveToken){connectDrive();return}const q=encodeURIComponent("name contains 'AlMada_Backup_' and trashed=false");const l=await fetch(`https://www.googleapis.com/drive/v3/files?q=${q}&orderBy=modifiedTime desc&pageSize=1&fields=files(id,name,modifiedTime)`,{headers:{Authorization:"Bearer "+driveToken}});const j=await l.json();if(!j.files?.length)return alert("لا توجد نسخ احتياطية");const f=j.files[0];if(!confirm("استعادة أحدث نسخة: "+f.name+"؟"))return;const r=await fetch(`https://www.googleapis.com/drive/v3/files/${f.id}?alt=media`,{headers:{Authorization:"Bearer "+driveToken}});const b=await r.json();state=b.state||state;saveState();if(b.auth)localStorage.setItem(AUTH_KEY,b.auth);fillSettings();refreshAll();alert("تمت الاستعادة من Google Drive")}
+
+function parseCSVLine(line){
+  const out=[];let cur="";let q=false;
+  for(let i=0;i<line.length;i++){
+    const ch=line[i];
+    if(ch==='"'){
+      if(q && line[i+1]==='"'){cur+='"';i++} else q=!q;
+    } else if(ch===',' && !q){out.push(cur);cur=""}
+    else cur+=ch;
+  }
+  out.push(cur);return out;
+}
+async function importProductsCSV(file){
+  if(!file)return;
+  const text=await file.text();
+  const lines=text.replace(/^\uFEFF/,'').split(/\r?\n/).filter(x=>x.trim());
+  if(lines.length<2)return alert("ملف CSV فارغ أو غير صالح");
+  const headers=parseCSVLine(lines[0]).map(x=>x.trim());
+  const required=["code","name","category","unit","cost","price","stock","minStock"];
+  if(!required.every(x=>headers.includes(x)))return alert("الأعمدة المطلوبة: "+required.join(", "));
+  let added=0,skipped=0;
+  const existing=new Set(state.products.map(p=>String(p.code||"").trim()));
+  for(let i=1;i<lines.length;i++){
+    const vals=parseCSVLine(lines[i]);
+    const row={};headers.forEach((h,j)=>row[h]=vals[j]??"");
+    const code=String(row.code||"").trim(),name=String(row.name||"").trim();
+    if(!code||!name)continue;
+    if(existing.has(code)){skipped++;continue}
+    state.products.push({
+      id:uid(),code,name,
+      category:String(row.category||"").trim(),
+      unit:String(row.unit||"قطعة").trim()||"قطعة",
+      cost:num(row.cost),price:num(row.price),stock:num(row.stock),minStock:num(row.minStock)
+    });
+    existing.add(code);added++;
+  }
+  saveState();renderProducts();renderLowStock();refreshDashboard();
+  $("productsImportFile").value="";
+  alert(`تم استيراد ${added} صنف جديد.\nتم تجاوز ${skipped} صنف لأن كوده موجود مسبقًا.`);
+}
+function csvEscape(v){
+  const s=String(v??"");
+  return /[",\n\r]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s;
+}
+function exportProductsCSV(){
+  const headers=["code","name","category","unit","cost","price","stock","minStock"];
+  const rows=[headers.join(",")].concat(state.products.map(p=>[
+    p.code,p.name,p.category,p.unit,p.cost,p.price,p.stock,p.minStock
+  ].map(csvEscape).join(",")));
+  downloadBlob("\uFEFF"+rows.join("\n"),"AlMada_Products.csv","text/csv;charset=utf-8");
+}
+
 function refreshAll(){renderInvoices();renderProducts();renderExpenses();renderLowStock();refreshDashboard();renderReport()}
 $("expDate").value=today();$("reportDay").value=today();$("reportMonth").value=monthNow();
 document.querySelectorAll(".num").forEach(el=>el.addEventListener("input",()=>{const x=norm(el.value);if(x!==el.value)el.value=x}));
